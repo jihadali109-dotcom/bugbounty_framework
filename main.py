@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import datetime
-from database import init_db, is_duplicate, save_finding
+from database import init_db, is_duplicate, save_finding, is_domain_scanned, mark_domain_scanned
 from reporter import send_telegram_message, format_report, format_summary_report
 from watcher import fetch_new_targets
 import sys
@@ -83,38 +83,46 @@ async def main():
     print("🚀 سیستەمی هێرشبەری زیرەک و ئۆتۆماتیکی (Distributed Hunter) بەگەڕخرا...")
     print("=" * 60 + "\n")
     
-    logging.info(">>> چاودێرەکە بەدوای ئامانجی نوێدا دەگەڕێت لە پلاتفۆرمەکان...")
+    # ڕاکێشانی هەموو دۆمەینەکان لە سەرچاوەکانەوە
+    all_targets = await fetch_new_targets()
+    all_targets_count = len(all_targets)
     
-    # ڕاکێشانی دۆمەینەکان
-    new_targets = await fetch_new_targets()
-    new_targets_count = len(new_targets)
+    # دۆزینەوەی ئەو دۆمەینانەی کە تا ئێستا هەرگیز پشکنینیان بۆ نەکراوە (Fresh Targets)
+    fresh_targets = [d for d in all_targets if not is_domain_scanned(d)]
     
-    # ڕیزکردنی ئامانجەکان بۆ ئەوەی هەر جارێک یەکسان بێن
-    sorted_targets = sorted(list(new_targets))
-    batch_size = 100
-    total_batches = max(1, len(sorted_targets) // batch_size)
+    # دیاریکردنی ١٠٠ ئامانجەکە
+    if fresh_targets:
+        # ئەگەر ئامانجی نوێ هەبێت، تەنها ئەوانە دەپشکنین (ئەوپەڕی ١٠٠ دانە)
+        queue_targets = fresh_targets[:100]
+        logging.info(f">>> 🔥 دۆزینەوەی ئامانجی نوێ! ١٠٠ ئامانجی تازە دەپشکنرێن پێش بەیانی...")
+    else:
+        # ئەگەر ئامانجی نوێ نەبوو، یەکێک لە "دوورەکان" (Batch) وەک جێگرەوە هەڵدەبژێرین
+        sorted_targets = sorted(list(all_targets))
+        batch_size = 100
+        total_batches = max(1, len(sorted_targets) // batch_size)
+        now = datetime.datetime.utcnow()
+        minutes_today = now.hour * 60 + now.minute
+        batch_index = (minutes_today // 60) % total_batches
+        start = batch_index * batch_size
+        queue_targets = sorted_targets[start : start + batch_size]
+        logging.info(f">>> ئامانجی نوێ نییە. بەردەوامبوون لەسەر دووری: {batch_index+1}/{total_batches}")
     
-    # بەپێی کاتی ڕۆژ دیاریکردنی کامین دووری هەڵبژێریت
-    # هەر کاتژمێرێک دووری جیاواز هەڵدەبژێرێت
-    now = datetime.datetime.utcnow()
-    minutes_today = now.hour * 60 + now.minute
-    batch_index = (minutes_today // 60) % total_batches
+    logging.info(f">>> پڕۆسەی پشکنین دەستیپێکرد بۆ {len(queue_targets)} ئامانج...")
     
-    start = batch_index * batch_size
-    queue_targets = sorted_targets[start : start + batch_size]
-    
-    logging.info(f">>> کۆی ئامانجەکان: {new_targets_count} | دووری ئێستا: {batch_index+1}/{total_batches} | ئامانج: {start+1} تا {start+len(queue_targets)}")
-    
-    # کرێکارەکان ئامادە دەکەین
+    # دەستپێکردنی کارەکە
     tasks = [process_target(domain) for domain in queue_targets]
     await asyncio.gather(*tasks)
     
+    # نیشانکردنی ئەوانەی پشکنراون بۆ ئەوەی جارێکی تر وەک "نوێ" نەناسرێنەوە
+    for d in queue_targets:
+        mark_domain_scanned(d)
+    
     # ناردنی ڕاپۆرتی پوختە
-    summary_msg = format_summary_report(len(queue_targets), 0, new_targets_count)
+    summary_msg = format_summary_report(len(queue_targets), 0, all_targets_count)
     await send_telegram_message(summary_msg)
     
     logging.info("=========================================")
-    logging.info(f">>> وەجبەی دووری {batch_index+1} کۆتایی هات. خولی داهاتوو: دووری {(batch_index+2) % total_batches + 1}")
+    logging.info(f">>> وەجبەی ئەم جارە بە سەرکەوتوویی کۆتایی هات.")
     logging.info("=========================================")
 
 if __name__ == "__main__":
